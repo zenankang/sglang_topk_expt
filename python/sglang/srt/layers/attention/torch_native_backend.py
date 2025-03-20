@@ -37,6 +37,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         scaling=None,
         enable_gqa=False,
         causal=False,
+        top_k=0,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -53,6 +54,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             scaling: float or None
             enable_gqa: bool
             causal: bool
+            top_k: 不为0时只选择top_k个token的kv进行计算
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -66,45 +68,63 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         start_q, start_kv = 0, 0
         for seq_idx in range(seq_lens.shape[0]):
-            # TODO: this loop process a sequence per iter, this is inefficient.
-            # Need optimize the performance later.
-
             extend_seq_len_q = extend_seq_lens[seq_idx]
-            prefill_seq_len_q = extend_prefix_lens[seq_idx]
-
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
             end_kv = start_kv + seq_len_kv
 
-            per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
+            q = query[:, start_q:end_q, :]
 
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
-
-            # get key and value from cache. per_req_tokens contains the kv cache
-            # index for each token in the sequence.
+            # 获取key和value
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            k = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            v = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
-            per_req_out_redudant = (
-                scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
+            if top_k == 0:
+                # 全量注意力计算
+                o = (
+                    scaled_dot_product_attention(
+                        q.unsqueeze(0),
+                        k.unsqueeze(0),
+                        v.unsqueeze(0),
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
                 )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            else:
+                # 稀疏注意力计算，只选择top_k个token
+                # 计算query和key的相似度
+                attn_weights = torch.matmul(
+                    q.unsqueeze(0), 
+                    k.unsqueeze(0).transpose(-1, -2)
+                ) * scaling
+                
+                # 获取top_k个最大值的索引
+                _, topk_indices = torch.topk(attn_weights, k=top_k, dim=-1)
+                
+                # 根据topk_indices选择对应的key和value
+                topk_k = torch.gather(k.unsqueeze(0), -2, topk_indices.expand(-1, -1, -1, k.size(-1)))
+                topk_v = torch.gather(v.unsqueeze(0), -2, topk_indices.expand(-1, -1, -1, v.size(-1)))
+                
+                # 重新计算注意力
+                o = (
+                    scaled_dot_product_attention(
+                        q.unsqueeze(0),
+                        topk_k,
+                        topk_v,
+                        enable_gqa=enable_gqa,
+                        scale=scaling,
+                        is_causal=causal,
+                    )
+                    .squeeze(0)
+                    .movedim(query.dim() - 2, 0)
+                )
+
+            output[start_q:end_q, :, :] = o
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -215,6 +235,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=not layer.is_cross_attention,
+            top_k=forward_batch.top_k if hasattr(forward_batch, "top_k") else 0
         )
         return o
 
